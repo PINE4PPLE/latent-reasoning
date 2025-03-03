@@ -1580,7 +1580,7 @@ class Qwen2ModelWithLatent(Qwen2Model):
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -1627,32 +1627,25 @@ class Qwen2ModelWithLatent(Qwen2Model):
         if isinstance(input_ids, list) or isinstance(input_ids, tuple):
             # We need to process the input_ids and inputs_embeds separately and output the wrapped logits
             embeddings = []
-            for sublist in input_ids:
-                
-                sublist_embeddings = []
-                for item in sublist:
-                    if isinstance(item, torch.Tensor) and item.dtype == torch.long:
-                        # If the item is a tensor of type long, treat it as input_ids
-                        sublist_embeddings.append(self.embed_tokens(item))
-                    elif isinstance(item, list) or isinstance(item, tuple): 
-                        # If the item is a float tensor, treat it as input_embed
-                        # sublist_embeddings.append(item)
-                        ids, weights = item
-                        assert len(ids) == len(weights)
-                        embeds = self.embed_tokens(ids)
-                        embeds = embeds * weights.unsqueeze(-1)
-                        embeds = embeds.sum(dim=1)
-                        sublist_embeddings.append(embeds)
-                    else:
-                        raise ValueError("Unsupported input type in the nested list.")
+            for item in input_ids:
+                if isinstance(item, torch.Tensor):
+                    embeddings.append(self.embed_tokens(item))
+                elif isinstance(item, list) or isinstance(item, tuple): 
+                    ids, weights = item
+                    assert len(ids) == len(weights)
+                    embeds = self.embed_tokens(ids)
+                    embeds = embeds * weights.unsqueeze(-1)
+                    embeds = embeds.sum(dim=1)
+                    embeddings.append(embeds.unsqueeze(1))
+                else:
+                    raise ValueError("Unsupported input type in the nested list.")
                 # Concatenate embeddings within the sublist along the sequence dimension
-                sublist_embed = torch.cat(sublist_embeddings, dim=1)
-                embeddings.append(sublist_embed)
-            # Stack all sublist embeddings along the batch dimension
-            inputs_embeds = torch.stack(embeddings, dim=0)
 
+            inputs_embeds = torch.cat(embeddings, dim=1)
+            print(inputs_embeds.shape)
         elif isinstance(input_ids, torch.Tensor) and input_ids.dtype == torch.long:
             inputs_embeds = self.embed_tokens(input_ids)
+            print(inputs_embeds.shape)
         else:
             raise ValueError("Unsupported input type.")
 
@@ -1734,7 +1727,7 @@ class Qwen2ModelWithLatent(Qwen2Model):
         )
 
 
-class Qwen2ForCausalLMwithLatent(Qwen2ForCausalLM):
+class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
