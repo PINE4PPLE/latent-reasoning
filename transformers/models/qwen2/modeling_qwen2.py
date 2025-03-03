@@ -1642,10 +1642,10 @@ class Qwen2ModelWithLatent(Qwen2Model):
                 # Concatenate embeddings within the sublist along the sequence dimension
 
             inputs_embeds = torch.cat(embeddings, dim=1)
-            print(inputs_embeds.shape)
+
         elif isinstance(input_ids, torch.Tensor) and input_ids.dtype == torch.long:
             inputs_embeds = self.embed_tokens(input_ids)
-            print(inputs_embeds.shape)
+
         else:
             raise ValueError("Unsupported input type.")
 
@@ -1767,6 +1767,9 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
         return scores_processed
 
 
+    def normalize_weight(self, weight):
+        return weight / weight.sum(dim=-1, keepdim=True)
+
     def logits_to_binary_distribution(self, logits, temperature=1.0, eps=1e-20, target_num=1):
         logits = logits / temperature
         # truncate logits with topk or topp
@@ -1777,8 +1780,6 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
         # convert to probability
         probs = F.softmax(logits, dim=-1)
         # convert to binary distribution
-        print(probs.shape)
-        print(target_num.shape)
         binary_probs = probs * target_num.unsqueeze(-1)
         return binary_probs
 
@@ -1894,12 +1895,11 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
             if len(vocab_idx) == 0:
                 vocab_idx = torch.argmax(sampling_prob).reshape(-1)
             idxs.append(vocab_idx)
-            weights.append(sampling_prob[vocab_idx])
+            weights.append(self.normalize_weight(sampling_prob[vocab_idx]))
         # padding to the same size
-        print(idxs)
         max_len = max([i.shape[0] for i in idxs])
         for i in range(bsz):
-            idxs[i] = F.pad(idxs[i], (0, max_len-len(idxs[i])), value=-100)
+            idxs[i] = F.pad(idxs[i], (0, max_len-len(idxs[i])), value=0)
             weights[i] = F.pad(weights[i], (0, max_len-len(weights[i])), value=0.0)
         idxs = torch.stack(idxs, dim=0)
         weights = torch.stack(weights, dim=0)
@@ -1908,23 +1908,24 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
 
     @torch.no_grad()
     def generate(self, input_ids, attention_mask=None, max_length=20, temperature=1.0, change_token_ids=0, eos_token_ids=1, max_latent_length=10):
+        bsz = input_ids.shape[0]
         if attention_mask is None:
             attention_mask = torch.ones(input_ids.shape)
         generated_ids = []
         generated_weights = []
         generated_target_num = []
         past_key_values = None
-        latent_mode = torch.tensor([True for _ in range(input_ids.shape[0])])
-        stoped = torch.tensor([False for _ in range(input_ids.shape[0])])
+        latent_mode = torch.tensor([True for _ in range(bsz)])
+        stoped = torch.tensor([False for _ in range(bsz)])
         input_ids = [input_ids]
         for i in range(max_length):
             outputs = self(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                use_cache=True,
+                use_cache=False,
                 past_key_values=past_key_values,
             )
-            past_key_values = outputs.past_key_values
+            # past_key_values = outputs.past_key_values
             logits = outputs.logits
             next_token_logits = logits[:, -1, :]
             # compute current latent length
@@ -1940,13 +1941,18 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
             binary_sampling_idx, binary_sampling_weight, target_num = self.binary_sample(next_token_logits, mu, sigma, temperature=temperature)
             # multinomial sampling
             prob = F.softmax(next_token_logits, dim=-1)
-            sampling_idx = torch.multinomial(prob, 1).squeeze(-1)
+            sampling_idx = torch.multinomial(prob, 1).reshape(-1,1)
             sampling_weight = torch.ones_like(sampling_idx).float()
             #padding sampling_idx and sampling_weight to the same size of binary_sampling_idx and binary_sampling_weight
-            max_len = max(len(binary_sampling_idx), len(sampling_idx))
-            sampling_idx = F.pad(sampling_idx, (0, max_len-len(sampling_idx)), value=-100)
-            sampling_weight = F.pad(sampling_weight, (0, max_len-len(sampling_weight)), value=0.0) 
+            max_len = max(binary_sampling_idx.shape[1], sampling_idx.shape[1])
+            sampling_idx = F.pad(sampling_idx, (0, max_len-sampling_idx.shape[1]), value=0)
+            sampling_weight = F.pad(sampling_weight, (0, max_len-sampling_weight.shape[1]), value=0.0) 
             # combine binary and multinomial sampling, latent mode is True, use binary sampling, otherwise use multinomial sampling
+            print("sampling_idx", sampling_idx.shape)
+            print("sampling_weight",sampling_weight.shape)
+            print("binary_sampling_idx",binary_sampling_idx.shape)
+            print("binary_sampling_weight",binary_sampling_weight.shape)
+
             sampling_idx = torch.where(latent_mode.reshape(-1, 1), binary_sampling_idx, sampling_idx)
             sampling_weight = torch.where(latent_mode.reshape(-1, 1), binary_sampling_weight, sampling_weight)
             # forcing the model prediction to change_token_ids for latent samples if forcing_to_change is not None and close latent mode
@@ -1954,9 +1960,9 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
                 forcing_prediction = torch.full_like(sampling_idx, change_token_ids)
                 forcing_weight = torch.full_like(sampling_weight, 1.0)
                 forcing_weight[:, 1:] = 0.0
-                sampling_idx = torch.where(forcing_to_change, forcing_prediction, sampling_idx)
-                sampling_weight = torch.where(forcing_to_change, forcing_weight, sampling_weight)
-                latent_mode = torch.tensor([False for _ in range(input_ids.shape[0])])
+                sampling_idx = torch.where(forcing_to_change.reshape(-1, 1), forcing_prediction, sampling_idx)
+                sampling_weight = torch.where(forcing_to_change.reshape(-1, 1), forcing_weight, sampling_weight)
+                latent_mode = torch.tensor([False for _ in range(bsz)])
                 
             generated_ids.append(sampling_idx)
             generated_weights.append(sampling_weight)
@@ -1969,7 +1975,7 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
             set_mode = torch.logical_and(sampling_idx == change_token_ids, sampling_weight > 0.5).any(dim=1)
             latent_mode = torch.logical_and(torch.logical_not(set_mode), latent_mode)
             # check whether to stop the generation, while in latent mode, the model never stop and not in latent mode, the model stop when the token is the same as the eos_token_ids and its weight equals to 1.0
-            stoped = torch.logical_or(stoped, torch.logical_and(torch.logical_not(latent_mode), torch.logical_and(sampling_idx == eos_token_ids, sampling_weight == 1.0)))
+            stoped = torch.logical_or(stoped, torch.logical_and(torch.logical_not(latent_mode), torch.logical_and(sampling_idx == eos_token_ids, sampling_weight == 1.0).any(dim=1)))
             if stoped.all():
                 break
         return generated_ids, generated_weights, generated_target_num
