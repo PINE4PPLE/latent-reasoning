@@ -47,6 +47,8 @@ else:
         "Qwen2PreTrainedModel",
         "Qwen2ForSequenceClassification",
         "Qwen2ForTokenClassification",
+        "Qwen2ModelWithLatent",
+        "Qwen2ForCausalLMWithLatent"
     ]
 
 
@@ -75,6 +77,8 @@ if TYPE_CHECKING:
             Qwen2ForTokenClassification,
             Qwen2Model,
             Qwen2PreTrainedModel,
+            Qwen2ModelWithLatent,
+            Qwen2ForCausalLMWithLatent
         )
 
 

@@ -3129,6 +3129,8 @@ else:
             "Qwen2ForTokenClassification",
             "Qwen2Model",
             "Qwen2PreTrainedModel",
+            "Qwen2ModelWithLatent",
+            "Qwen2ForCausalLMWithLatent"
         ]
     )
     _import_structure["models.qwen2_audio"].extend(
