@@ -1955,7 +1955,7 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
                 sampling_idx = F.pad(sampling_idx, (0, max_len-sampling_idx.shape[1]), value=0)
                 sampling_weight = F.pad(sampling_weight, (0, max_len-sampling_weight.shape[1]), value=0.0) 
                 # combine binary and multinomial sampling, latent mode is True, use binary sampling, otherwise use multinomial sampling
-                if not slient:
+                if not silent:
                     print("sampling_idx", sampling_idx.shape)
                     print("sampling_weight",sampling_weight.shape)
                     print("binary_sampling_idx",binary_sampling_idx.shape)
@@ -1966,7 +1966,7 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
                 prob = F.softmax(next_token_logits, dim=-1)
                 sampling_idx = torch.multinomial(prob, 1).reshape(-1,1)
                 sampling_weight = torch.ones_like(sampling_idx).float()
-                if not slient:
+                if not silent:
                     print("sampling_idx", sampling_idx.shape)
                     print("sampling_weight",sampling_weight.shape)
 
