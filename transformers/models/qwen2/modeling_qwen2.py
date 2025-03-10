@@ -1069,7 +1069,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 if attention_mask.shape[-1] > target_length:
                     attention_mask = attention_mask[:, :target_length]
                 mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(device)
                 padding_mask = padding_mask == 0
                 causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                     padding_mask, min_dtype
@@ -1641,14 +1641,14 @@ class Qwen2ModelWithLatent(Qwen2Model):
                     raise ValueError("Unsupported input type in the nested list.")
                 # Concatenate embeddings within the sublist along the sequence dimension
 
-            inputs_embeds = torch.cat(embeddings, dim=1)
+            inputs_embeds = torch.cat(embeddings, dim=1).to(self.embed_tokens.weight.dtype)
 
         elif isinstance(input_ids, torch.Tensor) and input_ids.dtype == torch.long:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids).to(self.embed_tokens.weight.dtype)
 
         else:
             raise ValueError("Unsupported input type.")
-
+        # print(inputs_embeds.device)
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -1926,12 +1926,12 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
         input_ids = [input_ids]
         for i in range(max_length):
             outputs = self(
-                input_ids=input_ids,
+                input_ids=[input_ids[-1]],
                 attention_mask=attention_mask,
-                use_cache=False,
+                use_cache=True,
                 past_key_values=past_key_values,
             )
-            # past_key_values = outputs.past_key_values
+            past_key_values = outputs.past_key_values
             logits = outputs.logits
             next_token_logits = logits[:, -1, :]
             # compute current latent length
