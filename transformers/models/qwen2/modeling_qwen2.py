@@ -1580,7 +1580,8 @@ class Qwen2ModelWithLatent(Qwen2Model):
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     def forward(
         self,
-        input_ids = None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_weights: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -1623,32 +1624,40 @@ class Qwen2ModelWithLatent(Qwen2Model):
                     "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
                     "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
                 )
+        raw_embeddings = self.embed_tokens(input_ids)
+        if input_weights is None:
+            input_weights = torch.zeros(input_ids.shape).to(input_ids.dtype).to(input_ids.device)
+            input_weights[:,:,0] = 1
+        if input_weights.dim() != raw_embeddings.dim():
+            input_weights = input_weights.unsqueeze(-1)
+        embeddings = raw_embeddings*input_weights
+        inputs_embeds = embeddings.sum(dim=-2)
+        # if isinstance(input_ids, list) or isinstance(input_ids, tuple):
+        #     # We need to process the input_ids and inputs_embeds separately and output the wrapped logits
+        #     embeddings = []
+        #     for item in input_ids:
+        #         if isinstance(item, torch.Tensor):
+        #             embeddings.append(self.embed_tokens(item))
+        #         elif isinstance(item, list) or isinstance(item, tuple): 
+        #             ids, weights = item
+        #             assert len(ids) == len(weights)
+        #             embeds = self.embed_tokens(ids)
+        #             embeds = embeds * weights.unsqueeze(-1)
+        #             embeds = embeds.sum(dim=1)
+        #             embeddings.append(embeds.unsqueeze(1))
+        #         else:
+        #             raise ValueError("Unsupported input type in the nested list.")
+        #         # Concatenate embeddings within the sublist along the sequence dimension
 
-        if isinstance(input_ids, list) or isinstance(input_ids, tuple):
-            # We need to process the input_ids and inputs_embeds separately and output the wrapped logits
-            embeddings = []
-            for item in input_ids:
-                if isinstance(item, torch.Tensor):
-                    embeddings.append(self.embed_tokens(item))
-                elif isinstance(item, list) or isinstance(item, tuple): 
-                    ids, weights = item
-                    assert len(ids) == len(weights)
-                    embeds = self.embed_tokens(ids)
-                    embeds = embeds * weights.unsqueeze(-1)
-                    embeds = embeds.sum(dim=1)
-                    embeddings.append(embeds.unsqueeze(1))
-                else:
-                    raise ValueError("Unsupported input type in the nested list.")
-                # Concatenate embeddings within the sublist along the sequence dimension
+        #     inputs_embeds = torch.cat(embeddings, dim=1).to(self.embed_tokens.weight.dtype)
 
-            inputs_embeds = torch.cat(embeddings, dim=1).to(self.embed_tokens.weight.dtype)
+        # elif isinstance(input_ids, torch.Tensor) and input_ids.dtype == torch.long:
+        #     inputs_embeds = self.embed_tokens(input_ids).to(self.embed_tokens.weight.dtype)
 
-        elif isinstance(input_ids, torch.Tensor) and input_ids.dtype == torch.long:
-            inputs_embeds = self.embed_tokens(input_ids).to(self.embed_tokens.weight.dtype)
-
-        else:
-            raise ValueError("Unsupported input type.")
+        # else:
+        #     raise ValueError("Unsupported input type.")
         # print(inputs_embeds.device)
+
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -1662,7 +1671,7 @@ class Qwen2ModelWithLatent(Qwen2Model):
         )
 
         hidden_states = inputs_embeds
-
+        # print(hidden_states.shape)
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -1725,6 +1734,16 @@ class Qwen2ModelWithLatent(Qwen2Model):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+
+class ClampSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, max_val, min_val):
+        return x.clamp(max=max_val, min=min_val)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # 直接返回原始梯度，忽略截断
+        return grad_output, None
 
 
 class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
@@ -1792,6 +1811,7 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        input_weights: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -1802,7 +1822,7 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        num_logits_to_keep: int = 0,
+        num_logits_to_keep: Optional[int] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPastForLatent]:
         r"""
@@ -1845,6 +1865,7 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
+            input_weights=input_weights,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1858,6 +1879,8 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
 
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        if num_logits_to_keep is None:
+            num_logits_to_keep = input_ids.shape[-1]
         logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
         mu = self.mu_estiation(hidden_states[:, -num_logits_to_keep:, :])
         sigma = self.sigma_estiation(hidden_states[:, -num_logits_to_keep:, :])
@@ -1912,25 +1935,50 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
         return idxs, weights, target_num
 
 
+    def paddingzero_to_target(self, input_tensor):
+        bsz, sampling_shape = input_tensor.shape
+        padding = torch.zeros(bsz, self.topk-sampling_shape).to(input_tensor.dtype).to(input_tensor.device)
+        return torch.cat((input_tensor, padding), dim=-1)
+
     @torch.no_grad()
-    def generate(self, input_ids, attention_mask=None, max_length=20, temperature=1.0, change_token_ids=0, eos_token_ids=1, max_latent_length=10, silent=True):
+    def generate(self, input_ids, attention_mask=None, input_weights=None, max_length=20, temperature=1.0, change_token_ids=0, eos_token_ids=1, max_latent_length=10, silent=True):
         bsz = input_ids.shape[0]
+        input_seq_len = input_ids.shape[1]
+        if input_ids.dim() ==2:
+            input_ids = torch.cat((input_ids.unsqueeze(-1), torch.zeros(bsz, input_seq_len, self.topk-1).to(input_ids.dtype).to(input_ids.device)), dim=-1)
         if attention_mask is None:
-            attention_mask = torch.ones(input_ids.shape)
+            attention_mask = torch.ones(input_ids.shape[:2])
+
+        if input_weights is None:
+            input_weights = torch.zeros(input_ids.shape).to(input_ids.dtype).to(input_ids.device)
+            input_weights[:,:,0] = 1
+
         generated_ids = []
         generated_weights = []
         generated_target_num = []
         past_key_values = None
         latent_mode = torch.tensor([True for _ in range(bsz)]).to(input_ids.device)
         stoped = torch.tensor([False for _ in range(bsz)]).to(input_ids.device)
-        input_ids = [input_ids]
+        # input_ids = [input_ids]
         for i in range(max_length):
-            outputs = self(
-                input_ids=[input_ids[-1]],
-                attention_mask=attention_mask,
-                use_cache=True,
-                past_key_values=past_key_values,
-            )
+            if past_key_values is None:
+                outputs = self(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    input_weights = input_weights,
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    num_logits_to_keep=1
+                )
+            else:
+                outputs = self(
+                    input_ids=input_ids[:,-1,:].unsqueeze(1),
+                    attention_mask=attention_mask,
+                    input_weights = input_weights[:,-1,:].unsqueeze(1),
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    num_logits_to_keep=1
+                )
             past_key_values = outputs.past_key_values
             logits = outputs.logits
             next_token_logits = logits[:, -1, :]
@@ -1962,13 +2010,16 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
                     print("binary_sampling_weight",binary_sampling_weight.shape)
                 sampling_idx = torch.where(latent_mode.reshape(-1, 1), binary_sampling_idx, sampling_idx)
                 sampling_weight = torch.where(latent_mode.reshape(-1, 1), binary_sampling_weight, sampling_weight)
+                target_num = torch.where(latent_mode.reshape(-1, 1), target_num, -1)
             else:
+                target_num = torch.ones(bsz)*-1
                 prob = F.softmax(next_token_logits, dim=-1)
                 sampling_idx = torch.multinomial(prob, 1).reshape(-1,1)
                 sampling_weight = torch.ones_like(sampling_idx).float()
                 if not silent:
                     print("sampling_idx", sampling_idx.shape)
                     print("sampling_weight",sampling_weight.shape)
+            
 
             # forcing the model prediction to change_token_ids for latent samples if forcing_to_change is not None and close latent mode
             if forcing_to_change is not None and latent_mode.any():
@@ -1979,12 +2030,15 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
                 sampling_idx = torch.where(forcing_to_change.reshape(-1, 1), forcing_prediction, sampling_idx)
                 sampling_weight = torch.where(forcing_to_change.reshape(-1, 1), forcing_weight, sampling_weight)
                 latent_mode = torch.tensor([False for _ in range(bsz)]).to(input_ids[0].device)
-                
+            
+            sampling_idx = self.paddingzero_to_target(sampling_idx)
+            sampling_weight = self.paddingzero_to_target(sampling_weight)
             generated_ids.append(sampling_idx)
             generated_weights.append(sampling_weight)
             generated_target_num.append(target_num)
             # update input_ids
-            input_ids.append((sampling_idx, sampling_weight))
+            input_ids = torch.cat((input_ids, sampling_idx.unsqueeze(1)), dim=1)
+            input_weights = torch.cat((input_weights, sampling_weight.unsqueeze(1)), dim=1)
             attention_mask = F.pad(attention_mask, (0, 1), value=1)
 
             # check whether to change the mode, if the token is the same as the change_token_ids and its weight greated than 0.5, set the mode to False. consiering the sampling idx may contains multiple tokens.
@@ -1998,6 +2052,54 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
             if stoped.all():
                 break
         return generated_ids, generated_weights, generated_target_num
+    
+
+    # TODO: debug
+    def probability_estimation(self, generated_ids, generated_weights, generated_target_num, attention_mask):
+        binary_probs = self.binary_probability_estimation(generated_ids, generated_weights, generated_target_num, attention_mask)
+        multinomial_probs = self.multinomial_probability_estimation(generated_ids, generated_weights, generated_target_num, attention_mask)
+        return torch.where(generated_target_num>0, binary_probs, multinomial_probs)
+
+
+    # TODO: debug
+    def multinomial_probability_estimation(self, generated_ids, generated_weights, generated_target_num, attention_mask):
+        output = self.forward(input_ids=generated_ids, input_weights=generated_weights, attention_mask=attention_mask)
+        logits = output.logits
+        generated_ids = generated_ids[:,:,0]
+        multinomial_probs = torch.softmax(logits, dim=-1)
+        return torch.gather(multinomial_probs, 2, generated_ids.unsqueeze(-1)).squeeze(-1)
+
+    # TODO: debug
+    def binary_probability_estimation(self, generated_ids, generated_weights, generated_target_num, attention_mask):
+        output = self.forward(input_ids=generated_ids, input_weights=generated_weights, attention_mask=attention_mask)
+        logits = output.logits
+        mu = output.mu
+        sigma = output.sigma
+        target_num = generated_target_num
+        binary_logits = self.logits_to_binary_distribution(logits, target_num=target_num)
+        binary_logits = ClampSTE.apply(binary_logits, 1.0, 0.0)# bsz, seqlen, vocab_size
+        rejected_logits = 1-binary_logits
+        # chosen_ids = torch.zeros(binary_logits.shape).to(generated_ids.device)
+        chosen_ids = self.convert_ids_to_binary_chosen(generated_ids, generated_weights, binary_logits.shape[-1])
+        total_porblity = torch.where(chosen_ids>0, binary_logits, rejected_logits)
+        sampling_probs = torch.prod(total_porblity, dim=-1)
+        normal_probs = self.normal_probability_estimation(mu, sigma, target_num)
+        return sampling_probs*normal_probs
+
+    # TODO: debug
+    def convert_ids_to_binary_chosen(self, generated_ids, generated_weights, vocab_size):
+        bsz, seqlen = generated_ids.shape
+        chosen_ids = torch.zeros(bsz, seqlen, vocab_size).to(generated_ids.device)
+        mask = generated_weights > 0
+        coords = torch.nonzero(mask)
+        chosen_ids[coords[:,0], coords[:,1], generated_ids[coords[:,0], coords[:,1], coords[:,2]]] = 1
+        return chosen_ids
+
+    # TODO: debug
+    def normal_probability_estimation(self, mu, sigma, target_number):
+        return torch.exp(-0.5*((target_number-mu-1)/sigma)**2)/(sigma*torch.sqrt(torch.tensor(2*np.pi)))
+
+
 
 
 
@@ -2015,4 +2117,28 @@ def probablity_estimation(probs, mu, sigma, chosen_ids):
         sampling_probs.append(sampling_prob)
     sampling_probs = torch.tensor(sampling_probs)
     return sampling_probs, normal_probs
-    
+
+
+def tokenize_with_weight(tokenizer, generated_ids, generated_weights):
+
+    def extract_tokens_and_weights(tokens, weights):
+        selected_tokens = tokens[weights > 0]
+        selected_weights = weights[weights > 0]
+        return selected_tokens, selected_weights
+
+    bsz = generated_ids[0].shape[0]
+    tokens = [[i[idx,:] for i in generated_ids] for idx in range(bsz)]
+    weights = [[i[idx,:] for i in generated_weights] for idx in range(bsz)]
+
+    filted_tokens = []
+    filted_weights = []
+    for t,w in zip(tokens, weights):
+        f_t = []
+        f_w = []
+        for t1, w1 in zip(t,w):
+            tmp_t, tmp_w = extract_tokens_and_weights(t1,w1)
+            f_t.append(tokenizer.decode(tmp_t))
+            f_w.append(tmp_w)
+        filted_tokens.append(f_t)
+        filted_weights.append(f_w)
+    return filted_tokens, filted_weights
