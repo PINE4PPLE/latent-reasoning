@@ -78,7 +78,7 @@ if TYPE_CHECKING:
             Qwen2Model,
             Qwen2PreTrainedModel,
             Qwen2ModelWithLatent,
-            Qwen2ForCausalLMWithLatent,
+            Qwen2ForCausalLMWithLatent
         )
 
 

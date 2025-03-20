@@ -33,7 +33,7 @@ from ..dynamic_module_utils import custom_object_save
 from ..feature_extraction_utils import PreTrainedFeatureExtractor
 from ..image_processing_utils import BaseImageProcessor
 from ..modelcard import ModelCard
-from ..models.auto.configuration_auto import AutoConfig
+from ..models.auto import AutoConfig, AutoTokenizer
 from ..processing_utils import ProcessorMixin
 from ..tokenization_utils import PreTrainedTokenizer
 from ..utils import (
@@ -45,6 +45,7 @@ from ..utils import (
     is_tf_available,
     is_torch_available,
     is_torch_cuda_available,
+    is_torch_hpu_available,
     is_torch_mlu_available,
     is_torch_mps_available,
     is_torch_musa_available,
@@ -65,6 +66,7 @@ if is_torch_available():
     import torch
     from torch.utils.data import DataLoader, Dataset
 
+    from ..modeling_utils import PreTrainedModel
     from ..models.auto.modeling_auto import AutoModel
 
     # Re-export for backward compatibility
@@ -383,7 +385,7 @@ def get_framework(model, revision: Optional[str] = None):
 
 def get_default_model_and_revision(
     targeted_task: Dict, framework: Optional[str], task_options: Optional[Any]
-) -> Union[str, Tuple[str, str]]:
+) -> Tuple[str, str]:
     """
     Select a default model to use for a given task. Defaults to pytorch if ambiguous.
 
@@ -400,7 +402,9 @@ def get_default_model_and_revision(
 
     Returns
 
-        `str` The model string representing the default model for this pipeline
+        Tuple:
+            - `str` The model string representing the default model for this pipeline.
+            - `str` The revision of the model.
     """
     if is_torch_available() and not is_tf_available():
         framework = "pt"
@@ -423,6 +427,62 @@ def get_default_model_and_revision(
         framework = "pt"
 
     return default_models[framework]
+
+
+def load_assistant_model(
+    model: "PreTrainedModel",
+    assistant_model: Optional[Union[str, "PreTrainedModel"]],
+    assistant_tokenizer: Optional[PreTrainedTokenizer],
+) -> Tuple[Optional["PreTrainedModel"], Optional[PreTrainedTokenizer]]:
+    """
+    Prepares the assistant model and the assistant tokenizer for a pipeline whose model that can call `generate`.
+
+    Args:
+        model ([`PreTrainedModel`]):
+            The main model that will be used by the pipeline to make predictions.
+        assistant_model (`str` or [`PreTrainedModel`], *optional*):
+            The assistant model that will be used by the pipeline to make predictions.
+        assistant_tokenizer ([`PreTrainedTokenizer`], *optional*):
+            The assistant tokenizer that will be used by the pipeline to encode data for the model.
+
+    Returns:
+        Tuple: The loaded assistant model and (optionally) the loaded tokenizer.
+    """
+    if not model.can_generate() or assistant_model is None:
+        return None, None
+
+    if getattr(model, "framework") != "pt" or not isinstance(model, PreTrainedModel):
+        raise ValueError(
+            "Assisted generation, triggered by the `assistant_model` argument, is only available for "
+            "`PreTrainedModel` model instances. For instance, TF or JAX models are not supported."
+        )
+
+    # If the model is passed as a string, load the model and the corresponding tokenizer
+    if isinstance(assistant_model, str):
+        assistant_config = AutoConfig.from_pretrained(assistant_model)
+        _, loaded_assistant_model = infer_framework_load_model(assistant_model, config=assistant_config)
+        loaded_assistant_model = loaded_assistant_model.to(device=model.device, dtype=model.dtype)
+        loaded_assistant_tokenizer = AutoTokenizer.from_pretrained(assistant_model)
+    else:
+        loaded_assistant_model = assistant_model
+        loaded_assistant_tokenizer = assistant_tokenizer
+
+    # Finally, let's check the tokenizers: if the two models have different tokenizers, we need to keep the assistant
+    # tokenizer
+    same_vocab_size = model.config.vocab_size == loaded_assistant_model.config.vocab_size
+    same_special_tokens = all(
+        getattr(model.config, token) == getattr(loaded_assistant_model.config, token)
+        for token in ("eos_token_id", "pad_token_id", "bos_token_id")
+    )
+    if same_vocab_size and same_special_tokens:
+        loaded_assistant_tokenizer = None
+    elif loaded_assistant_tokenizer is None:
+        raise ValueError(
+            "The assistant model has a different tokenizer than the main model. You should pass the assistant "
+            "tokenizer."
+        )
+
+    return loaded_assistant_model, loaded_assistant_tokenizer
 
 
 class PipelineException(Exception):
@@ -881,18 +941,7 @@ class Pipeline(_ScikitCompat, PushToHubMixin):
                 # Take the first device used by `accelerate`.
                 device = next(iter(hf_device_map.values()))
             else:
-                device = -1
-                if (
-                    is_torch_mlu_available()
-                    or is_torch_cuda_available()
-                    or is_torch_npu_available()
-                    or is_torch_xpu_available(check_device=True)
-                    or is_torch_mps_available()
-                ):
-                    logger.warning(
-                        "Hardware accelerator e.g. GPU is available in the environment, but no `device` argument"
-                        " is passed to the `Pipeline` object. Model will be on CPU."
-                    )
+                device = 0
 
         if is_torch_available() and self.framework == "pt":
             if device == -1 and self.model.device is not None:
@@ -915,14 +964,18 @@ class Pipeline(_ScikitCompat, PushToHubMixin):
                 self.device = torch.device(f"cuda:{device}")
             elif is_torch_npu_available():
                 self.device = torch.device(f"npu:{device}")
+            elif is_torch_hpu_available():
+                self.device = torch.device(f"hpu:{device}")
             elif is_torch_xpu_available(check_device=True):
                 self.device = torch.device(f"xpu:{device}")
             elif is_torch_mps_available():
                 self.device = torch.device(f"mps:{device}")
             else:
-                raise ValueError(f"{device} unrecognized or not available.")
+                self.device = torch.device("cpu")
         else:
             self.device = device if device is not None else -1
+
+        logger.warning(f"Device set to use {self.device}")
 
         self.binary_output = binary_output
         # We shouldn't call `model.to()` for models loaded with accelerate as well as the case that model is already on device
@@ -934,8 +987,13 @@ class Pipeline(_ScikitCompat, PushToHubMixin):
         ):
             self.model.to(self.device)
 
-        # If the model can generate, create a local generation config. This is done to avoid side-effects on the model
-        # as we apply local tweaks to the generation config.
+        # If the model can generate:
+        # 1 - create a local generation config. This is done to avoid side-effects on the model as we apply local
+        # tweaks to the generation config.
+        # 2 - load the assistant model if it is passed.
+        self.assistant_model, self.assistant_tokenizer = load_assistant_model(
+            self.model, kwargs.pop("assistant_model", None), kwargs.pop("assistant_tokenizer", None)
+        )
         if self.model.can_generate():
             self.prefix = self.model.config.prefix if hasattr(self.model.config, "prefix") else None
             self.generation_config = copy.deepcopy(self.model.generation_config)
@@ -959,6 +1017,14 @@ class Pipeline(_ScikitCompat, PushToHubMixin):
         self._batch_size = kwargs.pop("batch_size", None)
         self._num_workers = kwargs.pop("num_workers", None)
         self._preprocess_params, self._forward_params, self._postprocess_params = self._sanitize_parameters(**kwargs)
+
+        # In processor only mode, we can get the modality processors from the processor
+        if self.processor is not None and all(
+            [self.tokenizer is None, self.feature_extractor is None, self.image_processor is None]
+        ):
+            self.tokenizer = getattr(self.processor, "tokenizer", None)
+            self.feature_extractor = getattr(self.processor, "feature_extractor", None)
+            self.image_processor = getattr(self.processor, "image_processor", None)
 
         if self.image_processor is None and self.feature_extractor is not None:
             if isinstance(self.feature_extractor, BaseImageProcessor):
@@ -1086,6 +1152,9 @@ class Pipeline(_ScikitCompat, PushToHubMixin):
                     yield
             elif self.device.type == "musa":
                 with torch.musa.device(self.device):
+                    yield
+            elif self.device.type == "xpu":
+                with torch.xpu.device(self.device):
                     yield
             else:
                 yield

@@ -2,7 +2,7 @@
 import datetime
 import platform
 import subprocess
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, Union
 
 import numpy as np
 
@@ -51,7 +51,7 @@ def ffmpeg_microphone(
     chunk_length_s: float,
     format_for_conversion: str = "f32le",
     ffmpeg_input_device: Optional[str] = None,
-    ffmpeg_additional_args: Optional[List[str]] = None,
+    ffmpeg_additional_args: Optional[list[str]] = None,
 ):
     """
     Helper function to read audio from a microphone using ffmpeg. The default input device will be used unless another
@@ -68,7 +68,7 @@ def ffmpeg_microphone(
             The name of the format of the audio samples to be returned by ffmpeg. The standard is `f32le`, `s16le`
             could also be used.
         ffmpeg_input_device (`str`, *optional*):
-            The indentifier of the input device to be used by ffmpeg (i.e. ffmpeg's '-i' argument). If unset,
+            The identifier of the input device to be used by ffmpeg (i.e. ffmpeg's '-i' argument). If unset,
             the default input device will be used. See `https://www.ffmpeg.org/ffmpeg-devices.html#Input-Devices`
             for how to specify and list input devices.
         ffmpeg_additional_args (`list[str]`, *optional*):
@@ -138,7 +138,7 @@ def ffmpeg_microphone_live(
     stride_length_s: Optional[Union[Tuple[float, float], float]] = None,
     format_for_conversion: str = "f32le",
     ffmpeg_input_device: Optional[str] = None,
-    ffmpeg_additional_args: Optional[List[str]] = None,
+    ffmpeg_additional_args: Optional[list[str]] = None,
 ):
     """
     Helper function to read audio from a microphone using ffmpeg. This will output `partial` overlapping chunks starting
