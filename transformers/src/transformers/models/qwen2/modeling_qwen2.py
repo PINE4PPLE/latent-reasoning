@@ -1626,7 +1626,7 @@ class Qwen2ModelWithLatent(Qwen2Model):
                 )
         raw_embeddings = self.embed_tokens(input_ids)
         if input_weights is None:
-            input_weights = torch.zeros(input_ids.shape).to(input_ids.dtype).to(input_ids.device)
+            input_weights = torch.zeros(input_ids.shape).to(raw_embeddings.dtype).to(input_ids.device)
             input_weights[:,:,0] = 1
         if input_weights.dim() != raw_embeddings.dim():
             input_weights = input_weights.unsqueeze(-1)
@@ -1935,27 +1935,26 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
         return idxs, weights, target_num
 
 
-    def paddingzero_to_target(self, input_tensor):
+    def paddingzero_to_target(self, input_tensor, latent_beam_size):
         bsz, sampling_shape = input_tensor.shape
-        padding = torch.zeros(bsz, self.topk-sampling_shape).to(input_tensor.dtype).to(input_tensor.device)
+        padding = torch.zeros(bsz, latent_beam_size-sampling_shape).to(input_tensor.dtype).to(input_tensor.device)
         return torch.cat((input_tensor, padding), dim=-1)
 
     @torch.no_grad()
-    def generate(self, input_ids, attention_mask=None, input_weights=None, max_length=20, temperature=1.0, change_token_ids=0, eos_token_ids=1, max_latent_length=10, silent=True, pad_token_id=2):
+    def generate(self, input_ids, attention_mask=None, input_weights=None, max_length=20, latent_beam_size=5, temperature=1.0, top_p = 0.9, change_token_id=0, eos_token_id=1, max_latent_length=10, silent=True, pad_token_id=2):
         bsz = input_ids.shape[0]
         input_seq_len = input_ids.shape[1]
-        if input_ids.dim() ==2:
-            input_ids = torch.cat((input_ids.unsqueeze(-1), torch.zeros(bsz, input_seq_len, self.topk-1).to(input_ids.dtype).to(input_ids.device)), dim=-1)
+        if input_ids.dim() == 2:
+            input_ids = torch.cat((input_ids.unsqueeze(-1), torch.zeros(bsz, input_seq_len, latent_beam_size-1).to(input_ids.dtype).to(input_ids.device)), dim=-1)
         if attention_mask is None:
             attention_mask = torch.ones(input_ids.shape[:2])
 
         if input_weights is None:
-            input_weights = torch.zeros(input_ids.shape).to(input_ids.dtype).to(input_ids.device)
+            input_weights = torch.zeros(input_ids.shape).to(self.model.dtype).to(input_ids.device)
             input_weights[:,:,0] = 1
 
         generated_ids = []
         generated_weights = []
-        generated_target_num = []
         past_key_values = None
         latent_mode = torch.tensor([True for _ in range(bsz)]).to(input_ids.device)
         stoped = torch.tensor([False for _ in range(bsz)]).to(input_ids.device)
@@ -1982,83 +1981,88 @@ class Qwen2ForCausalLMWithLatent(Qwen2ForCausalLM):
             past_key_values = outputs.past_key_values
             logits = outputs.logits
             next_token_logits = logits[:, -1, :]
+            # get top_p logits
+            next_token_logits = self.top_p_logits(next_token_logits, top_p)
             # compute current latent length
             cur_latent_length = i
-            # if current latent length is greater than max_latent_length, set the latent mode to False and teacher forcing the model prediction to change_token_ids for latent samples.
+            # if current latent length is greater than max_latent_length, set the latent mode to False and teacher forcing the model prediction to change_token_id for latent samples.
             if cur_latent_length == max_latent_length:
                 forcing_to_change = latent_mode
             else:
                 forcing_to_change = None
 
             if latent_mode.any():
-                mu = outputs.mu[:,-1,:].squeeze()
-                sigma = outputs.sigma[:,-1,:].squeeze()
-                binary_sampling_idx, binary_sampling_weight, target_num = self.binary_sample(next_token_logits, mu, sigma, temperature=temperature)
-                # multinomial sampling
+                # compute probability distribution
                 prob = F.softmax(next_token_logits, dim=-1)
-                sampling_idx = torch.multinomial(prob, 1).reshape(-1,1)
-                sampling_weight = torch.ones_like(sampling_idx).float()
-                #padding sampling_idx and sampling_weight to the same size of binary_sampling_idx and binary_sampling_weight
-                max_len = max(binary_sampling_idx.shape[1], sampling_idx.shape[1])
-                sampling_idx = F.pad(sampling_idx, (0, max_len-sampling_idx.shape[1]), value=0)
-                sampling_weight = F.pad(sampling_weight, (0, max_len-sampling_weight.shape[1]), value=0.0) 
-                # combine binary and multinomial sampling, latent mode is True, use binary sampling, otherwise use multinomial sampling
-                if not silent:
-                    print("sampling_idx", sampling_idx.shape)
-                    print("sampling_weight",sampling_weight.shape)
-                    print("binary_sampling_idx",binary_sampling_idx.shape)
-                    print("binary_sampling_weight",binary_sampling_weight.shape)
-                sampling_idx = torch.where(latent_mode.reshape(-1, 1), binary_sampling_idx, sampling_idx)
-                sampling_weight = torch.where(latent_mode.reshape(-1, 1), binary_sampling_weight, sampling_weight)
-                target_num = torch.where(latent_mode.reshape(-1, 1), target_num, -1)
-            else:
-                target_num = torch.ones(bsz)*-1
-                prob = F.softmax(next_token_logits, dim=-1)
-                sampling_idx = torch.multinomial(prob, 1).reshape(-1,1)
-                sampling_weight = torch.ones_like(sampling_idx).float()
-                if not silent:
-                    print("sampling_idx", sampling_idx.shape)
-                    print("sampling_weight",sampling_weight.shape)
-            
 
-            # forcing the model prediction to change_token_ids for latent samples if forcing_to_change is not None and close latent mode
+                # latent beam sampling
+                latent_sampling_idx = torch.multinomial(prob, latent_beam_size).reshape(-1, latent_beam_size)
+                latent_sampling_logit = torch.gather(next_token_logits, 1, index=latent_sampling_idx)
+                latent_sampling_weight = F.softmax(latent_sampling_logit, dim=-1, dtype=input_weights.dtype)
+
+                # token sampling
+                token_sampling_idx = torch.multinomial(prob, 1).reshape(-1,1)
+                token_sampling_weight = torch.ones_like(token_sampling_idx, dtype=input_weights.dtype)
+                #padding sampling_idx and sampling_weight to the same size of latent_sampling_idx and latent_sampling_weight
+                max_len = max(latent_sampling_idx.shape[1], token_sampling_idx.shape[1])
+                sampling_idx = F.pad(token_sampling_idx, (0, max_len-token_sampling_idx.shape[1]), value=0)
+                sampling_weight = F.pad(token_sampling_weight, (0, max_len-token_sampling_weight.shape[1]), value=0.0) 
+
+                # check whether to change the mode, if the token is the same as the change_token_id, set the mode to False. consiering the sampling idx may contains multiple tokens.
+                set_mode = (token_sampling_idx == change_token_id).any(dim=1).to(latent_mode.device)
+                latent_mode = torch.logical_and(torch.logical_not(set_mode), latent_mode)
+                # combine latent and multinomial sampling, latent mode is True, use latent sampling, otherwise use token sampling
+                sampling_idx = torch.where(latent_mode.reshape(-1, 1), latent_sampling_idx, sampling_idx)
+                sampling_weight = torch.where(latent_mode.reshape(-1, 1), latent_sampling_weight, sampling_weight)
+
+                if not silent:
+                    print("sampling_idx", sampling_idx.shape)
+                    print("sampling_weight",sampling_weight.shape)
+                    print("latent_sampling_idx",latent_sampling_idx.shape)
+                    print("latent_sampling_weight",latent_sampling_weight.shape)
+            else:
+                prob = F.softmax(next_token_logits, dim=-1)
+                sampling_idx = torch.multinomial(prob, 1).reshape(-1,1)
+                sampling_weight = torch.ones_like(sampling_idx, dtype=input_weights.dtype)
+                if not silent:
+                    print("sampling_idx", sampling_idx.shape)
+                    print("sampling_weight",sampling_weight.shape)
+
+            # forcing the model prediction to change_token_id for latent samples if forcing_to_change is not None and close latent mode
             if forcing_to_change is not None and latent_mode.any():
                 # print('forcing')
-                forcing_prediction = torch.full_like(sampling_idx, change_token_ids).to(input_ids[0].device)
+                forcing_prediction = torch.full_like(sampling_idx, change_token_id).to(input_ids[0].device)
                 forcing_weight = torch.full_like(sampling_weight, 1.0).to(input_ids[0].device)
                 forcing_weight[:, 1:] = 0.0
                 sampling_idx = torch.where(forcing_to_change.reshape(-1, 1), forcing_prediction, sampling_idx)
                 sampling_weight = torch.where(forcing_to_change.reshape(-1, 1), forcing_weight, sampling_weight)
                 latent_mode = torch.tensor([False for _ in range(bsz)]).to(input_ids[0].device)
             
-            # process already ended samepls, replacing with pad_token_id, weight with 1.0, target_num with -1
+            # process already ended samepls, replacing with pad_token_id, weight with 1.0
             sampling_idx = torch.where(stoped.reshape(-1, 1), torch.full_like(sampling_idx, pad_token_id), sampling_idx)
             sampling_weight = torch.where(stoped.reshape(-1, 1), torch.full_like(sampling_weight, 1.0), sampling_weight)
-            target_num = torch.where(stoped, torch.full_like(target_num, -1), target_num)
-
-            # padding sampling_idx and sampling_weight to the same size of input_ids and input_weights
-            sampling_idx = self.paddingzero_to_target(sampling_idx)
-            sampling_weight = self.paddingzero_to_target(sampling_weight)
+            
+            sampling_idx = self.paddingzero_to_target(sampling_idx, latent_beam_size)
+            sampling_weight = self.paddingzero_to_target(sampling_weight, latent_beam_size)
 
             generated_ids.append(sampling_idx)
             generated_weights.append(sampling_weight)
-            generated_target_num.append(target_num)
             # update input_ids
             input_ids = torch.cat((input_ids, sampling_idx.unsqueeze(1)), dim=1)
             input_weights = torch.cat((input_weights, sampling_weight.unsqueeze(1)), dim=1)
             attention_mask = F.pad(attention_mask, (0, 1), value=1)
 
-            # check whether to change the mode, if the token is the same as the change_token_ids and its weight greated than 0.5, set the mode to False. consiering the sampling idx may contains multiple tokens.
-            set_mode = torch.logical_and(sampling_idx == change_token_ids, sampling_weight > 0.5).any(dim=1).to(latent_mode.device)
-            latent_mode = torch.logical_and(torch.logical_not(set_mode), latent_mode)
-            # check whether to stop the generation, while in latent mode, the model never stop and not in latent mode, the model stop when the token is the same as the eos_token_ids and its weight equals to 1.0
+            # # check whether to change the mode, if the token is the same as the change_token_id and its weight greated than 0.5, set the mode to False. consiering the sampling idx may contains multiple tokens.
+            # set_mode = (token_sampling_idx == change_token_id).any(dim=1).to(latent_mode.device)
+            # latent_mode = torch.logical_and(torch.logical_not(set_mode), latent_mode)
+            # check whether to stop the generation, while in latent mode, the model never stop and not in latent mode, the model stop when the token is the same as the eos_token_id and its weight equals to 1.0
             
-            new1 = torch.logical_and(sampling_idx == eos_token_ids, sampling_weight == 1.0).any(dim=1)
+            new1 = torch.logical_and(sampling_idx == eos_token_id, sampling_weight == 1.0).any(dim=1)
             new2 = torch.logical_and(torch.logical_not(latent_mode), new1)
             stoped = torch.logical_or(stoped, new2)
             if stoped.all():
                 break
-        return generated_ids, generated_weights, generated_target_num
+        return torch.stack(generated_ids, dim=1), torch.stack(generated_weights, dim=1)
     
 
     # TODO: debug
@@ -2123,7 +2127,7 @@ def probablity_estimation(probs, mu, sigma, chosen_ids):
     return sampling_probs, normal_probs
 
 
-def tokenize_with_weight(tokenizer, generated_ids, generated_weights):
+def detokenize_with_weight(tokenizer, generated_ids, generated_weights):
 
     def extract_tokens_and_weights(tokens, weights):
         selected_tokens = tokens[weights > 0]
@@ -2145,4 +2149,8 @@ def tokenize_with_weight(tokenizer, generated_ids, generated_weights):
             f_w.append(tmp_w)
         filted_tokens.append(f_t)
         filted_weights.append(f_w)
+
+    new_filted_tokens = [[filted_tokens[jdx][idx] for jdx in range(len(filted_tokens))] for idx in range(bsz)]
+    filted_weights = [[filted_weights[jdx][idx] for jdx in range(len(filted_weights))] for idx in range(bsz)]
+
     return filted_tokens, filted_weights
